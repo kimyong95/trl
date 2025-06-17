@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """
-python examples/scripts/ddpo.py \
+python examples/scripts/eft.py \
     --num_epochs=200 \
     --train_gradient_accumulation_steps=1 \
     --sample_num_steps=50 \
@@ -36,7 +36,7 @@ from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import EntryNotFoundError
 from transformers import CLIPModel, CLIPProcessor, HfArgumentParser, is_torch_npu_available, is_torch_xpu_available
 
-from trl import DDPOConfig, DDPOTrainer, DefaultDDPOStableDiffusionPipeline
+from trl import EFTConfig, EFTTrainer, DefaultDDPOStableDiffusionPipeline
 
 
 @dataclass
@@ -210,7 +210,7 @@ def image_outputs_logger(image_data, global_step, accelerate_logger):
 
 
 if __name__ == "__main__":
-    parser = HfArgumentParser((ScriptArguments, DDPOConfig))
+    parser = HfArgumentParser((ScriptArguments, EFTConfig))
     script_args, training_args = parser.parse_args_into_dataclasses()
     training_args.project_kwargs = {
         "logging_dir": "./logs",
@@ -225,7 +225,7 @@ if __name__ == "__main__":
         use_lora=script_args.use_lora,
     )
 
-    trainer = DDPOTrainer(
+    trainer = EFTTrainer(
         training_args,
         aesthetic_scorer(script_args.hf_hub_aesthetic_model_id, script_args.hf_hub_aesthetic_model_filename),
         prompt_fn,

@@ -53,6 +53,10 @@ class DDPOPipelineOutput:
     images: torch.Tensor
     latents: torch.Tensor
     log_probs: torch.Tensor
+    prev_sample_means: torch.Tensor
+    noise_preds: torch.Tensor
+    noises: torch.Tensor
+    
 
 
 @dataclass
@@ -69,6 +73,8 @@ class DDPOSchedulerOutput:
 
     latents: torch.Tensor
     log_probs: torch.Tensor
+    prev_sample_mean: torch.Tensor
+    variance_noise: torch.Tensor = None
 
 
 class DDPOStableDiffusionPipeline:
@@ -298,7 +304,8 @@ def scheduler_step(
             "Cannot pass both generator and prev_sample. Please make sure that either `generator` or"
             " `prev_sample` stays `None`."
         )
-
+    
+    variance_noise = None
     if prev_sample is None:
         variance_noise = randn_tensor(
             model_output.shape,
@@ -317,8 +324,7 @@ def scheduler_step(
     # mean along all but batch dimension
     log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
 
-    return DDPOSchedulerOutput(prev_sample.type(sample.dtype), log_prob)
-
+    return DDPOSchedulerOutput(prev_sample.type(sample.dtype), log_prob, prev_sample_mean, variance_noise)
 
 # 1. The output type for call is different as the logprobs are now returned
 # 2. An extra method called `scheduler_step` is added which is used to constraint the scheduler output
@@ -343,6 +349,7 @@ def pipeline_step(
     callback_steps: int = 1,
     cross_attention_kwargs: Optional[dict[str, Any]] = None,
     guidance_rescale: float = 0.0,
+    start_from_intermidiate: dict = None,
 ):
     r"""
     Function invoked when calling the pipeline for generation.  Args: prompt (`str` or `list[str]`, *optional*): The prompt or prompts to guide the image generation. If not defined, one has to pass `prompt_embeds`.  instead.  height (`int`, *optional*, defaults to self.unet.config.sample_size * self.vae_scale_factor): The height in pixels of the generated image.
@@ -470,8 +477,19 @@ def pipeline_step(
     num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
     all_latents = [latents]
     all_log_probs = []
+    all_prev_sample_means = []
+    all_noise_preds = []
+    all_noises = []
     with self.progress_bar(total=num_inference_steps) as progress_bar:
         for i, t in enumerate(timesteps):
+
+            if start_from_intermidiate is not None:
+                if i < start_from_intermidiate["iteration"]:
+                    progress_bar.update()
+                    continue
+                elif i == start_from_intermidiate["iteration"]:
+                    latents = start_from_intermidiate["latents"]
+
             # expand the latents if we are doing classifier free guidance
             latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
             latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
@@ -498,9 +516,14 @@ def pipeline_step(
             scheduler_output = scheduler_step(self.scheduler, noise_pred, t, latents, eta)
             latents = scheduler_output.latents
             log_prob = scheduler_output.log_probs
+            prev_sample_mean = scheduler_output.prev_sample_mean
+            variance_noise = scheduler_output.variance_noise
 
             all_latents.append(latents)
             all_log_probs.append(log_prob)
+            all_prev_sample_means.append(prev_sample_mean)
+            all_noise_preds.append(noise_pred)
+            all_noises.append(variance_noise)
 
             # call the callback, if provided
             if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
@@ -526,7 +549,7 @@ def pipeline_step(
     if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
         self.final_offload_hook.offload()
 
-    return DDPOPipelineOutput(image, all_latents, all_log_probs)
+    return DDPOPipelineOutput(image, all_latents, all_log_probs, all_prev_sample_means, all_noise_preds, all_noises)
 
 
 def pipeline_step_with_grad(
