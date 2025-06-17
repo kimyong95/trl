@@ -817,6 +817,11 @@ class DefaultDDPOStableDiffusionPipeline(DDPOStableDiffusionPipeline):
             pretrained_model_name, revision=pretrained_model_revision
         )
 
+        unet_pretrained = StableDiffusionPipeline.from_pretrained(
+            pretrained_model_name, revision=pretrained_model_revision, subfolder="unet",
+        )
+        self.sd_pipeline.unet_pretrained = unet_pretrained.unet
+
         self.use_lora = use_lora
         self.pretrained_model = pretrained_model_name
         self.pretrained_revision = pretrained_model_revision
@@ -843,6 +848,7 @@ class DefaultDDPOStableDiffusionPipeline(DDPOStableDiffusionPipeline):
         self.sd_pipeline.vae.requires_grad_(False)
         self.sd_pipeline.text_encoder.requires_grad_(False)
         self.sd_pipeline.unet.requires_grad_(not self.use_lora)
+        self.sd_pipeline.unet_pretrained.requires_grad_(False)
 
     def __call__(self, *args, **kwargs) -> DDPOPipelineOutput:
         return pipeline_step(self.sd_pipeline, *args, **kwargs)
@@ -856,6 +862,10 @@ class DefaultDDPOStableDiffusionPipeline(DDPOStableDiffusionPipeline):
     @property
     def unet(self):
         return self.sd_pipeline.unet
+
+    @property
+    def unet_pretrained(self):
+        return self.sd_pipeline.unet_pretrained
 
     @property
     def vae(self):

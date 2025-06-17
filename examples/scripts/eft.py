@@ -38,7 +38,6 @@ from transformers import CLIPModel, CLIPProcessor, HfArgumentParser, is_torch_np
 
 from trl import EFTConfig, EFTTrainer, DefaultDDPOStableDiffusionPipeline
 
-
 @dataclass
 class ScriptArguments:
     r"""
@@ -180,7 +179,6 @@ animals = [
     "kangaroo",
 ]
 
-
 def prompt_fn():
     return np.random.choice(animals), {}
 
@@ -212,6 +210,10 @@ def image_outputs_logger(image_data, global_step, accelerate_logger):
 if __name__ == "__main__":
     parser = HfArgumentParser((ScriptArguments, EFTConfig))
     script_args, training_args = parser.parse_args_into_dataclasses()
+    
+    if not training_args.tracker_kwargs:
+        training_args.tracker_kwargs = {"wandb": {"name": training_args.exp_name}}
+
     training_args.project_kwargs = {
         "logging_dir": "./logs",
         "automatic_checkpoint_naming": True,
@@ -234,8 +236,3 @@ if __name__ == "__main__":
     )
 
     trainer.train()
-
-    # Save and push to hub
-    trainer.save_model(training_args.output_dir)
-    if training_args.push_to_hub:
-        trainer.push_to_hub(dataset_name=script_args.dataset_name)

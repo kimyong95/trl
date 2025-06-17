@@ -137,7 +137,7 @@ class EFTConfig:
         },
     )
     tracker_kwargs: dict = field(
-        default_factory=lambda: {"wandb": {"name": "EFT"}},
+        default_factory=dict,
         metadata={"help": "Keyword arguments for the tracker (e.g. wandb_project)."},
     )
     accelerator_kwargs: dict = field(
@@ -255,6 +255,10 @@ class EFTConfig:
     train_timestep_fraction: float = field(
         default=1.0,
         metadata={"help": "Fraction of timesteps to train on."},
+    )
+    kl_beta: float = field(
+        default=0.0,
+        metadata={"help": "beta for KL-regularization."},
     )
     per_prompt_stat_tracking: bool = field(
         default=False,

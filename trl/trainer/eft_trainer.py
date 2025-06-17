@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import numpy as np
 import textwrap
 from collections import defaultdict
 from concurrent import futures
@@ -146,6 +147,7 @@ class EFTTrainer(PyTorchModelHubMixin):
         self.sd_pipeline.vae.to(self.accelerator.device, dtype=inference_dtype)
         self.sd_pipeline.text_encoder.to(self.accelerator.device, dtype=inference_dtype)
         self.sd_pipeline.unet.to(self.accelerator.device, dtype=inference_dtype)
+        self.sd_pipeline.unet_pretrained.to(self.accelerator.device, dtype=inference_dtype)
 
         trainable_layers = self.sd_pipeline.get_trainable_layers()
 
@@ -255,7 +257,8 @@ class EFTTrainer(PyTorchModelHubMixin):
         rewards = self.accelerator.gather(rewards).cpu().numpy()
 
         self.accelerator.log(
-            {
+            {   
+                "num_feedbacks": len(rewards) * epoch,
                 "reward": rewards,
                 "epoch": epoch,
                 "reward_mean": rewards.mean(),
@@ -286,15 +289,17 @@ class EFTTrainer(PyTorchModelHubMixin):
         for inner_epoch in range(self.config.train_num_inner_epochs):
             # shuffle samples along batch dimension
             perm = torch.randperm(total_batch_size, device=self.accelerator.device)
+
+            # if commented, no shuffle
             samples = {k: v[perm] for k, v in samples.items()}
 
             # shuffle along time dimension independently for each sample
-            # still trying to understand the code below
             perms = torch.stack(
                 [torch.randperm(num_timesteps, device=self.accelerator.device) for _ in range(total_batch_size)]
             )
 
-            for key in ["timesteps", "latents", "next_latents", "log_probs"]:
+            # if commented, no shuffle
+            for key in ["timesteps", "latents", "next_latents", "prev_sample_means", "log_probs", "noises", "noise_preds"]:
                 samples[key] = samples[key][
                     torch.arange(total_batch_size, device=self.accelerator.device)[:, None],
                     perms,
@@ -323,7 +328,7 @@ class EFTTrainer(PyTorchModelHubMixin):
 
         return global_step
 
-    def calculate_loss(self, latents, timesteps, next_latents, log_probs, advantages, embeds):
+    def calculate_loss(self, latents, timesteps, next_latents, log_probs, advantages, noises, noise_preds, prev_sample_means, embeds, last_latents):
         """
         Calculate the loss for a batch of an unpacked sample
 
@@ -346,34 +351,65 @@ class EFTTrainer(PyTorchModelHubMixin):
             loss (torch.Tensor), approx_kl (torch.Tensor), clipfrac (torch.Tensor)
             (all of these are of shape (1,))
         """
+        ################## calculate log-probs of current model ##################
         with self.autocast():
             if self.config.train_cfg:
-                noise_pred = self.sd_pipeline.unet(
+                noise_preds_curr = self.sd_pipeline.unet(
                     torch.cat([latents] * 2),
                     torch.cat([timesteps] * 2),
                     embeds,
                 ).sample
-                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                noise_pred = noise_pred_uncond + self.config.sample_guidance_scale * (
-                    noise_pred_text - noise_pred_uncond
+                noise_preds_curr_uncond, noise_preds_curr_text = noise_preds_curr.chunk(2)
+                noise_preds_curr = noise_preds_curr_uncond + self.config.sample_guidance_scale * (
+                    noise_preds_curr_text - noise_preds_curr_uncond
                 )
             else:
-                noise_pred = self.sd_pipeline.unet(
+                noise_preds_curr = self.sd_pipeline.unet(
                     latents,
                     timesteps,
                     embeds,
                 ).sample
-            # compute the log prob of next_latents given latents under the current model
 
             scheduler_step_output = self.sd_pipeline.scheduler_step(
-                noise_pred,
+                noise_preds_curr,
                 timesteps,
                 latents,
                 eta=self.config.sample_eta,
                 prev_sample=next_latents,
             )
 
-            log_prob = scheduler_step_output.log_probs
+            log_probs_curr = scheduler_step_output.log_probs
+            prev_sample_means_curr = scheduler_step_output.prev_sample_mean
+
+        ################## calculate log-probs of pretrained model ##################
+        with self.autocast():
+            if self.config.train_cfg:
+                noise_preds_pre = self.sd_pipeline.unet_pretrained(
+                    torch.cat([latents] * 2),
+                    torch.cat([timesteps] * 2),
+                    embeds,
+                ).sample
+                noise_preds_pre_uncond, noise_preds_pre_text = noise_preds_pre.chunk(2)
+                noise_preds_pre = noise_preds_pre_uncond + self.config.sample_guidance_scale * (
+                    noise_preds_pre_text - noise_preds_pre_uncond
+                )
+            else:
+                noise_preds_pre = self.sd_pipeline.unet_pretrained(
+                    latents,
+                    timesteps,
+                    embeds,
+                ).sample
+
+            scheduler_step_output = self.sd_pipeline.scheduler_step(
+                noise_preds_pre,
+                timesteps,
+                latents,
+                eta=self.config.sample_eta,
+                prev_sample=next_latents,
+            )
+
+            log_probs_pre = scheduler_step_output.log_probs
+            prev_sample_means_pre = scheduler_step_output.prev_sample_mean
 
         advantages = torch.clamp(
             advantages,
@@ -381,29 +417,19 @@ class EFTTrainer(PyTorchModelHubMixin):
             self.config.train_adv_clip_max,
         )
 
-        ratio = torch.exp(log_prob - log_probs)
+        ratio = torch.exp(log_probs_curr - log_probs)
+        kl_regularizer = 1 / (2 * std_dev_t**2) * ((prev_sample_means_curr - prev_sample_means_pre) ** 2).mean([1, 2, 3])
 
-        loss = self.loss(advantages, self.config.train_clip_range, ratio)
-
-        approx_kl = 0.5 * torch.mean((log_prob - log_probs) ** 2)
-
-        clipfrac = torch.mean((torch.abs(ratio - 1.0) > self.config.train_clip_range).float())
+        loss = torch.maximum(
+            -advantages * ratio,
+            -advantages * torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range)
+        ) + self.config.kl_beta * kl_regularizer
+        loss = loss.mean()
+        approx_kl = None
+        clipfrac = None
 
         return loss, approx_kl, clipfrac
 
-    def loss(
-        self,
-        advantages: torch.Tensor,
-        clip_range: float,
-        ratio: torch.Tensor,
-    ):
-        unclipped_loss = -advantages * ratio
-        clipped_loss = -advantages * torch.clamp(
-            ratio,
-            1.0 - clip_range,
-            1.0 + clip_range,
-        )
-        return torch.mean(torch.maximum(unclipped_loss, clipped_loss))
 
     def _setup_optimizer(self, trainable_layers_parameters):
         if self.config.train_use_8bit_adam:
@@ -470,10 +496,16 @@ class EFTTrainer(PyTorchModelHubMixin):
 
                 images = sd_output.images
                 latents = sd_output.latents
+                noise_preds = sd_output.noise_preds
+                prev_sample_means = sd_output.prev_sample_means
+                noises = sd_output.noises
                 log_probs = sd_output.log_probs
 
             latents = torch.stack(latents, dim=1)  # (batch_size, num_steps + 1, ...)
             log_probs = torch.stack(log_probs, dim=1)  # (batch_size, num_steps, 1)
+            noises = torch.stack(noises, dim=1)  # (batch_size, num_steps, ...)
+            noise_preds = torch.stack(noise_preds, dim=1)  # (batch_size, num_steps, ...)
+            prev_sample_means = torch.stack(prev_sample_means, dim=1)  # (batch_size, num_steps, ...)
             timesteps = self.sd_pipeline.scheduler.timesteps.repeat(batch_size, 1)  # (batch_size, num_steps)
 
             samples.append(
@@ -483,6 +515,9 @@ class EFTTrainer(PyTorchModelHubMixin):
                     "timesteps": timesteps,
                     "latents": latents[:, :-1],  # each entry is the latent before timestep t
                     "next_latents": latents[:, 1:],  # each entry is the latent after timestep t
+                    "noises": noises, # the epsilon that added to noise_pred (of latents) and produced the next_latents
+                    "noise_preds": noise_preds,  # the noise_pred of latents
+                    "prev_sample_means": prev_sample_means,  # the predicted mean of previous sample
                     "log_probs": log_probs,
                     "negative_prompt_embeds": sample_neg_prompt_embeds,
                 }
@@ -524,10 +559,12 @@ class EFTTrainer(PyTorchModelHubMixin):
                         sample["next_latents"][:, j],
                         sample["log_probs"][:, j],
                         sample["advantages"],
+                        sample["noises"][:, j],
+                        sample["noise_preds"][:, j],
+                        sample["prev_sample_means"][:, j],
                         embeds,
+                        sample["next_latents"][:, -1],
                     )
-                    info["approx_kl"].append(approx_kl)
-                    info["clipfrac"].append(clipfrac)
                     info["loss"].append(loss)
 
                     self.accelerator.backward(loss)
